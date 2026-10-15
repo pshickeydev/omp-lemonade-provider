@@ -3,10 +3,11 @@
 // Registers a "lemonade" provider whose fetchDynamicModels maps lemonade's
 // /v1/models `labels` onto omp model metadata: the `reasoning` label onto a
 // thinking effort ladder (off => reasoning_effort:"none"), `vision` onto
-// image input, `chat` onto the roster filter. Models that reason without the
-// `reasoning` label are tracked in the gitignored extra-reasoning.local.json
-// next to this file; run /lemonade-probe inside omp to populate it. Install,
-// configuration, and limitations: see README.md.
+// image input, `chat` onto the roster filter, and the reported-or-derived
+// output cap onto maxTokens. Models that reason without the `reasoning` label
+// are tracked in the gitignored extra-reasoning.local.json next to this file;
+// run /lemonade-probe inside omp to populate it. Install, configuration, and
+// limitations: see README.md.
 
 import { readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -22,11 +23,44 @@ const LEMONADE_BASE_URL = (process.env.LEMONADE_BASE_URL ?? "http://localhost:13
 // exceed it are skipped, not force-loaded.
 const PROBE_TIMEOUT_MS = 120_000;
 
+// Output cap when the server reports none, the ceiling for a derived cap, and
+// the input room a derived cap leaves behind.
+//
+// lemonade publishes a completion cap (`max_output_tokens` plus the
+// `max_completion_tokens` alias) only for cloud-recipe models, where it copies
+// the upstream provider's limits. Local llama.cpp/FLM models report nothing:
+// GGUF metadata carries only the trained context, llama.cpp starts at
+// n_predict:-1, and the server injects no default, so a local model's real
+// ceiling is its window minus the prompt. Hence: prefer the reported cap,
+// otherwise leave the prompt some headroom so a small-window model never
+// advertises an output cap that fills its own window, and keep the default
+// ceiling so a 256K-window model cannot turn a runaway generation into hours of
+// local decoding.
+const DEFAULT_MAX_OUTPUT_TOKENS = 32_768;
+const MIN_MAX_OUTPUT_TOKENS = 1_024;
+const INPUT_HEADROOM_TOKENS = 8_192;
+
+const positiveInt = (value: unknown): number | undefined =>
+  typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : undefined;
+
+function resolveMaxTokens(entry: LemonadeModelEntry, contextWindow: number): number {
+  const reported = positiveInt(entry.max_output_tokens) ?? positiveInt(entry.max_completion_tokens);
+  const derived = Math.max(
+    MIN_MAX_OUTPUT_TOKENS,
+    Math.min(DEFAULT_MAX_OUTPUT_TOKENS, contextWindow - INPUT_HEADROOM_TOKENS),
+  );
+  // Never advertise more than the window, even for windows below the floor.
+  return Math.max(1, Math.min(reported ?? derived, contextWindow));
+}
+
 interface LemonadeModelEntry {
   id: string;
   labels?: string[];
   context_length?: number;
   max_context_window?: number;
+  // Emitted together, and only for `cloud`-recipe models (see resolveMaxTokens).
+  max_output_tokens?: number;
+  max_completion_tokens?: number;
 }
 
 interface ExtraReasoningFile {
@@ -152,7 +186,7 @@ export default function lemonadeProvider(pi: ExtensionAPI) {
             input: ["text" as const, ...(m.labels?.includes("vision") ? (["image"] as const) : [])],
             cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
             contextWindow: context,
-            maxTokens: 32768,
+            maxTokens: resolveMaxTokens(m, context),
             // reasoningDisableMode "none-effort" makes thinking-off send
             // reasoning_effort:"none", the hard reasoning-off lemonade
             // (llama.cpp-backed) understands; graded levels forward verbatim.

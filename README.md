@@ -19,6 +19,9 @@ limits — it ignores lemonade's `labels` array. This extension reads
 - `chat` label → chat roster filter (non-chat entries are excluded)
 - `context_length` / `max_context_window` → context window (falls back to
   128000 when the server reports neither)
+- `max_output_tokens` / `max_completion_tokens` → output cap, when the server
+  reports one; otherwise derived from the context window (see
+  [Output cap](#output-cap))
 
 Models that emit `reasoning_content` without the `reasoning` label (common on
 custom fine-tunes — verified on 4 of 6 models on one instance) are tracked in a
@@ -80,6 +83,32 @@ models), and appends models whose response carries `reasoning_content` to
 cold models JIT-load on first probe and can take minutes. After it reports
 additions, run `omp models refresh lemonade` (or restart omp) to apply.
 
+## Output cap
+
+omp needs a per-model output cap (`maxTokens`), and lemonade reports one only
+for `cloud`-recipe models: the server writes `max_output_tokens` plus its
+OpenAI alias `max_completion_tokens` from the limits it parsed out of the
+upstream provider's model entry, and omits both when the value is zero. Local
+llama.cpp / FLM models report nothing — GGUF metadata carries only the trained
+context, llama.cpp starts without a generation cap (`n_predict: -1`), the router
+injects no default, and `POST /api/show` answers `num_ctx -1`. Their ceiling is
+the runtime window minus the prompt.
+
+Discovery therefore takes the first of:
+
+1. `max_output_tokens`, then `max_completion_tokens` — any positive integer,
+   clamped to the context window;
+2. `contextWindow - 8192`, capped at 32768 and floored at 1024.
+
+The 32768 ceiling keeps a 256K-window model from turning a runaway generation
+into hours of local decoding; the headroom stops a small-window model from
+advertising an output cap that fills its own window (the 32K-context
+`BugTraceAI-CORE-Fast`: 32768 → 24576). Overshooting is harmless either way:
+llama.cpp truncates at the window instead of rejecting the request (verified —
+`max_tokens: 1000000` on a 262144-token model returns a normal `stop`), and omp
+re-fits every request's cap to the room actually left
+(`fitOutputTokensToContextWindow`).
+
 ## Verification
 
 - `omp models find lemonade` — roster with thinking ladders on reasoners
@@ -94,8 +123,12 @@ additions, run `omp models refresh lemonade` (or restart omp) to apply.
 - Effort levels route through OpenAI `reasoning_effort`; lemonade forwards
   values other than `"none"` verbatim to llama.cpp, so graded effects are
   chat-template-dependent per model.
-- `maxTokens` is fixed at 32768 for all models; output caps reported by the
-  server are not read.
+- See [Output cap](#output-cap) for how `maxTokens` is chosen and why most
+  lemonade models report no cap at all.
+- The context window follows `max_context_window` (the static trained context)
+  before `context_length`, which tracks the loaded or configured `ctx_size`. A
+  model pinned to a smaller `ctx_size` in lemonade is still budgeted at its full
+  window here.
 - Thinking levels are selected via `--thinking` / `/thinking`; the
   `lemonade/<id>:high` selector suffix does not resolve for
   extension-registered models.
