@@ -1,31 +1,21 @@
 // omp extension: lemonade-server provider with capability-aware discovery.
 //
-// Registers a "lemonade" provider whose fetchDynamicModels reads the
-// server's /v1/models list (including lemonade-specific `labels`) and maps
-// the "reasoning" label onto omp thinking metadata, so the effort ladder
-// (low/medium/high) is served automatically for reasoning models instead
-// of requiring per-model modelOverrides entries.
-//
-// Installed as a symlink from ~/.omp/agent/extensions/lemonade-provider.ts.
-// The server URL defaults to localhost; point LEMONADE_BASE_URL at another
-// lemonade instance (e.g. the LAN box) to use it.
-//
-// Models that reason without lemonade's "reasoning" label are tracked in
-// extra-reasoning.local.json next to this file (gitignored — see
-// extra-reasoning.example.json for the format). On a fresh checkout the
-// file is absent and detection degrades to label-only. Run /lemonade-probe
-// inside omp to probe the current server and populate the file.
-//
-// Note: `apiKey` is a placeholder. lemonade is keyless, and omp extensions
-// require a credential field for custom providers, so every request carries
-// a harmless `Authorization: Bearer LEMONADE_API_KEY_PLACEHOLDER` header.
+// Registers a "lemonade" provider whose fetchDynamicModels maps lemonade's
+// /v1/models `labels` onto omp model metadata: the `reasoning` label onto a
+// thinking effort ladder (off => reasoning_effort:"none"), `vision` onto
+// image input, `chat` onto the roster filter. Models that reason without the
+// `reasoning` label are tracked in the gitignored extra-reasoning.local.json
+// next to this file; run /lemonade-probe inside omp to populate it. Install,
+// configuration, and limitations: see README.md.
 
 import { readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
-const LEMONADE_BASE_URL = process.env.LEMONADE_BASE_URL ?? "http://localhost:13305";
+// Trailing slashes in the override would produce `//v1/...` request paths.
+const LEMONADE_BASE_URL = (process.env.LEMONADE_BASE_URL ?? "http://localhost:13305").replace(/\/+$/, "");
 
 // Per-probe wall-clock budget. Generous because probing a cold model
 // JIT-loads its GGUF first (observed 90s+ on a 30GB box); models that
@@ -37,16 +27,11 @@ interface LemonadeModelEntry {
   labels?: string[];
   context_length?: number;
   max_context_window?: number;
-  suggested?: boolean;
 }
 
 interface ExtraReasoningFile {
   extraReasoning?: Record<string, true>;
 }
-
-// extra-reasoning.local.json lives beside the real source file (realpath
-// follows the ~/.omp/agent/extensions install symlink), so it stays in the
-// repo checkout rather than the symlink directory.
 
 // Missing file is the normal fresh-checkout path: label-only detection.
 // A corrupt file warns once and also degrades to label-only detection.
@@ -54,10 +39,15 @@ function loadExtraReasoning(dir: string, warn: (message: string) => void): Recor
   try {
     const parsed: unknown = JSON.parse(readFileSync(join(dir, "extra-reasoning.local.json"), "utf8"));
     // Narrow the parsed shape instead of casting; a malformed file degrades
-    // to label-only detection.
+    // to label-only detection. Values are filtered to `true` so hand-edited
+    // `false` entries drop out instead of being probed forever.
     if (parsed !== null && typeof parsed === "object" && "extraReasoning" in parsed) {
-      const map = (parsed as { extraReasoning: unknown }).extraReasoning;
-      if (map !== null && typeof map === "object") return map as Record<string, true>;
+      const map = parsed.extraReasoning; // unknown, guarded by `in` above
+      if (map !== null && typeof map === "object") {
+        const filtered = Object.entries(map).filter(([, value]) => value === true);
+        // The filter guarantees every value is `true`.
+        return Object.fromEntries(filtered) as Record<string, true>;
+      }
     }
     return {};
   } catch (error: unknown) {
@@ -72,8 +62,59 @@ function loadExtraReasoning(dir: string, warn: (message: string) => void): Recor
   }
 }
 
+// Element boundary check for /v1/models: `id` is the only field read
+// unconditionally.
+const isModelEntry = (value: unknown): value is LemonadeModelEntry =>
+  typeof value === "object" && value !== null && "id" in value && typeof value.id === "string";
+
+type ModelListResult =
+  | { ok: true; entries: LemonadeModelEntry[] }
+  | { ok: false; error: string };
+
+// Shared /v1/models read for discovery and /lemonade-probe; never throws so
+// callers keep their own logging surface (pi.logger vs ctx.ui.notify).
+async function fetchModelList(): Promise<ModelListResult> {
+  try {
+    const response = await fetch(`${LEMONADE_BASE_URL}/v1/models`, {
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!response.ok) {
+      return { ok: false, error: `/v1/models returned HTTP ${response.status}` };
+    }
+    const payload: unknown = await response.json();
+    // Runtime-narrow the wire shape; per-entry fields stay optional and are
+    // read with ?. downstream.
+    if (payload === null || typeof payload !== "object" || !("data" in payload)) {
+      return { ok: true, entries: [] };
+    }
+    const data = payload.data;
+    return { ok: true, entries: Array.isArray(data) ? data.filter(isModelEntry) : [] };
+  } catch (error: unknown) {
+    return { ok: false, error: `cannot reach ${LEMONADE_BASE_URL}: ${String(error)}` };
+  }
+}
+
+const isChat = (m: LemonadeModelEntry): boolean => m.labels?.includes("chat") ?? false;
+
+// Narrow a chat-completion payload to "first choice emitted non-empty
+// reasoning_content" without an unchecked cast; OpenAI-compatible servers
+// return { choices: [{ message: { reasoning_content?: string } }] }.
+function carriesReasoningContent(payload: unknown): boolean {
+  if (typeof payload !== "object" || payload === null || !("choices" in payload)) return false;
+  const choices = payload.choices;
+  if (!Array.isArray(choices)) return false;
+  const first = choices[0];
+  if (typeof first !== "object" || first === null || !("message" in first)) return false;
+  const message = first.message;
+  if (typeof message !== "object" || message === null || !("reasoning_content" in message)) return false;
+  return typeof message.reasoning_content === "string" && message.reasoning_content !== "";
+}
+
 export default function lemonadeProvider(pi: ExtensionAPI) {
-  const dir = realpathSync(dirname(import.meta.url.replace(/^file:\/\//, "")));
+  // extra-reasoning.local.json lives beside the real source file (realpath
+  // follows the ~/.omp/agent/extensions install symlink), so it stays in the
+  // repo checkout rather than the symlink directory.
+  const dir = realpathSync(dirname(fileURLToPath(import.meta.url)));
   const extraReasoning = loadExtraReasoning(dir, (message) => pi.logger?.warn?.(message));
 
   pi.registerProvider("lemonade", {
@@ -84,33 +125,23 @@ export default function lemonadeProvider(pi: ExtensionAPI) {
     // spelling; extensions use an apiKey placeholder instead.
     apiKey: "LEMONADE_API_KEY_PLACEHOLDER",
     fetchDynamicModels: async () => {
-      const response = await fetch(`${LEMONADE_BASE_URL}/v1/models`, {
-        signal: AbortSignal.timeout(10_000),
-      }).catch((error: unknown) => {
-        pi.logger?.warn?.(`lemonade-provider: model fetch failed: ${String(error)}`);
-        return null;
-      });
-      if (!response || !response.ok) {
-        if (response) {
-          pi.logger?.warn?.(
-            `lemonade-provider: /v1/models returned HTTP ${response.status}`,
-          );
-        }
+      const result = await fetchModelList();
+      if (!result.ok) {
+        pi.logger?.warn?.(`lemonade-provider: ${result.error}`);
         return [];
       }
-      const payload = (await response.json()) as { data?: LemonadeModelEntry[] };
-      const entries = payload.data ?? [];
 
-      return entries
-        .filter((m) => Array.isArray(m.labels) && m.labels.includes("chat"))
+      return result.entries
+        .filter(isChat)
         .map((m) => {
+          // 128000 is the fallback when the server reports neither field.
           const context = m.max_context_window ?? m.context_length ?? 128000;
           // The "reasoning" label is authoritative when present, but models in
           // extra-reasoning.local.json were probed to emit reasoning_content
-          // without it. All of them accept reasoning_effort:"none" as a hard
-          // off, so the ladder and the minimal->none mapping apply to them.
-          // Unknown future models default to the server label only; probe
-          // them with /lemonade-probe.
+          // without it. Both accept reasoning_effort:"none" as a hard off, so
+          // the ladder and the off->none mapping apply to them. Unknown future
+          // models default to the server label only; probe them with
+          // /lemonade-probe.
           const isReasoning =
             (m.labels?.includes("reasoning") ?? false) || extraReasoning[m.id] === true;
           return {
@@ -122,9 +153,9 @@ export default function lemonadeProvider(pi: ExtensionAPI) {
             cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
             contextWindow: context,
             maxTokens: 32768,
-            // reasoningEffortMap maps minimal to "none" because lemonade
-            // (llama.cpp-backed) treats reasoning_effort:"none" as a hard
-            // reasoning-off request.
+            // reasoningDisableMode "none-effort" makes thinking-off send
+            // reasoning_effort:"none", the hard reasoning-off lemonade
+            // (llama.cpp-backed) understands; graded levels forward verbatim.
             ...(isReasoning
               ? {
                   thinking: {
@@ -132,7 +163,7 @@ export default function lemonadeProvider(pi: ExtensionAPI) {
                     efforts: ["low", "medium", "high"] as const,
                     defaultLevel: "medium" as const,
                   },
-                  compat: { reasoningEffortMap: { minimal: "none" } },
+                  compat: { reasoningDisableMode: "none-effort" as const },
                 }
               : {}),
           };
@@ -150,24 +181,16 @@ export default function lemonadeProvider(pi: ExtensionAPI) {
     description: "Probe lemonade chat models for unlabeled reasoning support and update the local list",
     handler: async (_args, ctx) => {
       ctx.ui.notify("lemonade-probe: fetching model list...", "info");
-      let entries: LemonadeModelEntry[];
-      try {
-        const response = await fetch(`${LEMONADE_BASE_URL}/v1/models`, {
-          signal: AbortSignal.timeout(10_000),
-        });
-        if (!response.ok) {
-          ctx.ui.notify(`lemonade-probe: /v1/models returned HTTP ${response.status}`, "error");
-          return;
-        }
-        entries = (((await response.json()) as { data?: LemonadeModelEntry[] }).data ?? []);
-      } catch (error: unknown) {
-        ctx.ui.notify(`lemonade-probe: cannot reach ${LEMONADE_BASE_URL}: ${String(error)}`, "error");
+      const result = await fetchModelList();
+      if (!result.ok) {
+        ctx.ui.notify(`lemonade-probe: ${result.error}`, "error");
         return;
       }
+      const entries = result.entries;
 
       const unlabeled = entries.filter(
         (m) =>
-          m.labels?.includes("chat") &&
+          isChat(m) &&
           !(m.labels?.includes("reasoning") ?? false) &&
           extraReasoning[m.id] !== true,
       );
@@ -197,15 +220,10 @@ export default function lemonadeProvider(pi: ExtensionAPI) {
             signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
           });
           if (!response.ok) {
-            ctx.ui.notify(`  ${model.id}: HTTP ${response.status}, skipping`, "warn");
+            ctx.ui.notify(`  ${model.id}: HTTP ${response.status}, skipping`, "warning");
             continue;
           }
-          const message = (
-            (await response.json()) as {
-              choices?: { message?: { reasoning_content?: string } }[];
-            }
-          ).choices?.[0]?.message;
-          if (message?.reasoning_content) {
+          if (carriesReasoningContent(await response.json())) {
             discovered.push(model.id);
             extraReasoning[model.id] = true;
             ctx.ui.notify(`  ${model.id}: reasoning detected`, "info");
@@ -213,12 +231,12 @@ export default function lemonadeProvider(pi: ExtensionAPI) {
             ctx.ui.notify(`  ${model.id}: no reasoning content`, "info");
           }
         } catch (error: unknown) {
-          ctx.ui.notify(`  ${model.id}: probe failed (${String(error)}), skipping`, "warn");
+          ctx.ui.notify(`  ${model.id}: probe failed (${String(error)}), skipping`, "warning");
         }
       }
 
       if (discovered.length > 0) {
-        const file: ExtraReasoningFile = { extraReasoning: extraReasoning };
+        const file: ExtraReasoningFile = { extraReasoning };
         const path = join(dir, "extra-reasoning.local.json");
         writeFileSync(path, `${JSON.stringify(file, null, 2)}\n`);
         ctx.ui.notify(

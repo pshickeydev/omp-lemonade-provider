@@ -1,6 +1,6 @@
 # omp-lemonade-provider
 
-An [omp](https://github.com/lemonade-sdk/lemonade) extension that registers a
+An [omp](https://github.com/can1357/oh-my-pi) extension that registers a
 `lemonade` provider with capability-aware model discovery for
 [Lemonade Server](https://github.com/lemonade-sdk/lemonade) (AMD's local LLM
 runtime).
@@ -12,11 +12,13 @@ limits — it ignores lemonade's `labels` array. This extension reads
 `GET /v1/models` including `labels` and derives:
 
 - `reasoning` label → thinking metadata (`low|medium|high` effort ladder,
-  `defaultLevel: medium`) with `minimal` mapped to `reasoning_effort: "none"`,
-  which lemonade (llama.cpp-backed) treats as a hard reasoning-off request
+  `defaultLevel: medium`); thinking `off` sends `reasoning_effort: "none"`
+  (`compat.reasoningDisableMode: "none-effort"`), which lemonade
+  (llama.cpp-backed) treats as a hard reasoning-off request
 - `vision` label → image input
 - `chat` label → chat roster filter (non-chat entries are excluded)
-- `context_length` / `max_context_window` → context window
+- `context_length` / `max_context_window` → context window (falls back to
+  128000 when the server reports neither)
 
 Models that emit `reasoning_content` without the `reasoning` label (common on
 custom fine-tunes — verified on 4 of 6 models on one instance) are tracked in a
