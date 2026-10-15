@@ -168,8 +168,15 @@ export default function lemonadeProvider(pi: ExtensionAPI) {
       return result.entries
         .filter(isChat)
         .map((m) => {
-          // 128000 is the fallback when the server reports neither field.
-          const context = m.max_context_window ?? m.context_length ?? 128000;
+          // `context_length` is the effective window: the loaded ctx_size, else
+          // the configured one, else the static maximum (server.cpp
+          // resolve_context_length). Lemonade auto-tunes ctx_size to the memory
+          // left for the KV cache and omp's own openai-compat discovery maps the
+          // same field, so this is the value the server will actually serve;
+          // max_context_window is only the model's ceiling, and 128000 the last
+          // resort when the server reports neither field.
+          const context =
+            positiveInt(m.context_length) ?? positiveInt(m.max_context_window) ?? 128000;
           // The "reasoning" label is authoritative when present, but models in
           // extra-reasoning.local.json were probed to emit reasoning_content
           // without it. Both accept reasoning_effort:"none" as a hard off, so
