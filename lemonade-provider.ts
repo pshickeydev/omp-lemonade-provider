@@ -102,7 +102,7 @@ const isModelEntry = (value: unknown): value is LemonadeModelEntry =>
   typeof value === "object" && value !== null && "id" in value && typeof value.id === "string";
 
 type ModelListResult =
-  | { ok: true; entries: LemonadeModelEntry[] }
+  | { ok: true; entries: LemonadeModelEntry[]; validCatalog: boolean }
   | { ok: false; error: string };
 
 // Shared /v1/models read for discovery and /lemonade-probe; never throws so
@@ -119,10 +119,18 @@ async function fetchModelList(): Promise<ModelListResult> {
     // Runtime-narrow the wire shape; per-entry fields stay optional and are
     // read with ?. downstream.
     if (payload === null || typeof payload !== "object" || !("data" in payload)) {
-      return { ok: true, entries: [] };
+      // No `data` array: malformed/unexpected catalog. Mark invalid so the
+      // caller does not treat an empty list as a real, model-free server.
+      return { ok: true, entries: [], validCatalog: false };
     }
     const data = payload.data;
-    return { ok: true, entries: Array.isArray(data) ? data.filter(isModelEntry) : [] };
+    return {
+      ok: true,
+      entries: Array.isArray(data) ? data.filter(isModelEntry) : [],
+      // A present `data` array — even an empty one — is a trustworthy read, so
+      // pruning is safe. A missing or non-array one is not.
+      validCatalog: Array.isArray(data),
+    };
   } catch (error: unknown) {
     return { ok: false, error: `cannot reach ${LEMONADE_BASE_URL}: ${String(error)}` };
   }
@@ -252,67 +260,95 @@ export default function lemonadeProvider(pi: ExtensionAPI) {
       }
       const entries = result.entries;
 
+      // A malformed /v1/models (no data array) yields an empty, untrustworthy
+      // list. Refuse to prune rather than wiping the local list on a bad read;
+      // a genuinely empty catalog (empty array) is trustworthy and prunes.
+      if (!result.validCatalog) {
+        ctx.ui.notify(
+          "lemonade-probe: /v1/models response had no data array; pruned nothing and have nothing to probe.",
+          "warning",
+        );
+        return;
+      }
+
+      // Drop stale keys: a model removed from the server drops out of the
+      // /v1/models catalog, so any local entry whose ID is now absent is dead
+      // weight. Prune first so removal is tracked even when nothing new is to
+      // be probed.
+      const staleIds = Object.keys(extraReasoning).filter((id) =>
+        !entries.some((m) => m.id === id),
+      );
+      for (const id of staleIds) delete extraReasoning[id];
+
       const unlabeled = entries.filter(
         (m) =>
           isChat(m) &&
           !(m.labels?.includes("reasoning") ?? false) &&
           extraReasoning[m.id] !== true,
       );
-      if (unlabeled.length === 0) {
-        ctx.ui.notify("lemonade-probe: no new unlabeled chat models to probe.", "info");
+
+      if (unlabeled.length === 0 && staleIds.length === 0) {
+        ctx.ui.notify("lemonade-probe: nothing new to probe and no stale entries to remove.", "info");
         return;
       }
 
-      ctx.ui.notify(
-        `lemonade-probe: probing ${unlabeled.length} model(s) sequentially — cold models load on first use and can take minutes each.`,
-        "info",
-      );
-
       const discovered: string[] = [];
-      for (const model of unlabeled) {
-        try {
-          const response = await fetch(`${LEMONADE_BASE_URL}/v1/chat/completions`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              model: model.id,
-              messages: [
-                { role: "user", content: "What is 17*23? Think briefly then answer." },
-              ],
-              max_tokens: 512,
-            }),
-            signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
-          });
-          if (!response.ok) {
-            ctx.ui.notify(`  ${model.id}: HTTP ${response.status}, skipping`, "warning");
-            continue;
+      if (unlabeled.length > 0) {
+        if (staleIds.length > 0) {
+          ctx.ui.notify(
+            `lemonade-probe: removed ${staleIds.length} stale model(s) no longer on the server.`,
+            "info",
+          );
+        }
+        ctx.ui.notify(
+          `lemonade-probe: probing ${unlabeled.length} model(s) sequentially — cold models load on first use and can take minutes each.`,
+          "info",
+        );
+        for (const model of unlabeled) {
+          try {
+            const response = await fetch(`${LEMONADE_BASE_URL}/v1/chat/completions`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                model: model.id,
+                messages: [
+                  { role: "user", content: "What is 17*23? Think briefly then answer." },
+                ],
+                max_tokens: 512,
+              }),
+              signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
+            });
+            if (!response.ok) {
+              ctx.ui.notify(`  ${model.id}: HTTP ${response.status}, skipping`, "warning");
+              continue;
+            }
+            const payload: unknown = await response.json();
+            if (carriesReasoningContent(payload)) {
+              discovered.push(model.id);
+              extraReasoning[model.id] = true;
+              ctx.ui.notify(`  ${model.id}: reasoning detected`, "info");
+            } else if (completionEmittedContent(payload)) {
+              ctx.ui.notify(`  ${model.id}: no reasoning content`, "info");
+            } else {
+              // HTTP 200 but no output: lemonade may be masking a backend
+              // error, so the probe result is unknown, not "no reasoning".
+              ctx.ui.notify(
+                `  ${model.id}: HTTP 200 with empty completion (lemonade may be masking an upstream error), skipping`,
+                "warning",
+              );
+            }
+          } catch (error: unknown) {
+            ctx.ui.notify(`  ${model.id}: probe failed (${String(error)}), skipping`, "warning");
           }
-          const payload: unknown = await response.json();
-          if (carriesReasoningContent(payload)) {
-            discovered.push(model.id);
-            extraReasoning[model.id] = true;
-            ctx.ui.notify(`  ${model.id}: reasoning detected`, "info");
-          } else if (completionEmittedContent(payload)) {
-            ctx.ui.notify(`  ${model.id}: no reasoning content`, "info");
-          } else {
-            // HTTP 200 but no output: lemonade may be masking a backend
-            // error, so the probe result is unknown, not "no reasoning".
-            ctx.ui.notify(
-              `  ${model.id}: HTTP 200 with empty completion (lemonade may be masking an upstream error), skipping`,
-              "warning",
-            );
-          }
-        } catch (error: unknown) {
-          ctx.ui.notify(`  ${model.id}: probe failed (${String(error)}), skipping`, "warning");
         }
       }
 
-      if (discovered.length > 0) {
+      if (discovered.length > 0 || staleIds.length > 0) {
         const file: ExtraReasoningFile = { extraReasoning };
         const path = join(dir, "extra-reasoning.local.json");
         writeFileSync(path, `${JSON.stringify(file, null, 2)}\n`);
         ctx.ui.notify(
-          `lemonade-probe: added ${discovered.length} model(s) to ${path}. Run \`omp models refresh lemonade\` (or restart omp) to apply.`,
+          `lemonade-probe: wrote ${path} — added ${discovered.length}, removed ${staleIds.length} stale model(s). Run \`omp models refresh lemonade\` (or restart omp) to apply.`,
           "info",
         );
       } else {

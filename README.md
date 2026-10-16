@@ -80,8 +80,14 @@ listed, with a small completion request (`"What is 17*23? Think briefly then
 answer."`, `max_tokens: 512` — trivial prompts don't elicit reasoning on all
 models), and appends models whose response carries `reasoning_content` to
 `extra-reasoning.local.json`. Probes run sequentially with a 120 s budget each;
-cold models JIT-load on first probe and can take minutes. After it reports
-additions, run `omp models refresh lemonade` (or restart omp) to apply.
+cold models JIT-load on first probe and can take minutes. It also drops any
+entry in `extra-reasoning.local.json` for a model that is no longer on the
+server (gone from `/v1/models`), so the list does not accumulate dead
+entries — it rewrites the file whenever it adds or removes something. If the
+server's `/v1/models` response is malformed (no `data` array) the list is left
+untouched and this is reported, so a bad read can never wipe it.
+After it
+reports additions, run `omp models refresh lemonade` (or restart omp) to apply.
 
 ## Output cap
 
