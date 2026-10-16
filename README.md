@@ -132,6 +132,20 @@ every request's cap to the room actually left
   auto-tunes `ctx_size` to the memory left for the KV cache, so loading other
   models or editing `ctx_size` changes what one refresh reports. Re-run
   `omp models refresh lemonade` after such a change.
+- A prompt that exceeds the server's loaded `ctx_size` can come back as
+  **HTTP 200 with an empty completion**, not a 400: lemonade relays backend
+  `exceed_context_size_error` rejections through its SSE stream with the
+  status code lost (observed: a 310K-token prompt against `--ctx-size
+  262144`). omp's openai-completions transport can only see the 200, so
+  the session shows an empty assistant reply (if the relayed stream also
+  carries a benign finish chunk, omp's empty-completion retry may first
+  burn its replays on the deterministic failure). The advertised
+  `contextWindow` is the one lever keeping omp's compaction under the
+  server limit, so on an unexplained empty response first check for a stale
+  window (the preceding bullet) and re-run `omp models refresh lemonade`;
+  `/lemonade-probe` likewise reports empty completions as unknown outcomes,
+  never as "no reasoning content". Restoring the lost status code is an
+  upstream lemonade fix.
 - Thinking levels are selected via `--thinking` / `/thinking`; the
   `lemonade/<id>:high` selector suffix does not resolve for
   extension-registered models.

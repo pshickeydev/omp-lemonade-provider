@@ -144,6 +144,29 @@ function carriesReasoningContent(payload: unknown): boolean {
   return typeof message.reasoning_content === "string" && message.reasoning_content !== "";
 }
 
+// Whether a probe completion emitted any output at all. The "no reasoning
+// content" verdict is only trustworthy when this is true: lemonade relays
+// some backend failures (e.g. a context-size 400 from llama.cpp) as HTTP
+// 200 with zero delta parts, so a payload with neither content nor
+// reasoning_content is an unknown outcome, not a negative probe result.
+function completionEmittedContent(payload: unknown): boolean {
+  if (typeof payload !== "object" || payload === null || !("choices" in payload)) return false;
+  const choices = payload.choices;
+  if (!Array.isArray(choices)) return false;
+  const first = choices[0];
+  if (typeof first !== "object" || first === null || !("message" in first)) return false;
+  const message = first.message;
+  if (typeof message !== "object" || message === null) return false;
+  if ("content" in message && typeof message.content === "string" && message.content !== "") {
+    return true;
+  }
+  return (
+    "reasoning_content" in message &&
+    typeof message.reasoning_content === "string" &&
+    message.reasoning_content !== ""
+  );
+}
+
 export default function lemonadeProvider(pi: ExtensionAPI) {
   // extra-reasoning.local.json lives beside the real source file (realpath
   // follows the ~/.omp/agent/extensions install symlink), so it stays in the
@@ -264,12 +287,20 @@ export default function lemonadeProvider(pi: ExtensionAPI) {
             ctx.ui.notify(`  ${model.id}: HTTP ${response.status}, skipping`, "warning");
             continue;
           }
-          if (carriesReasoningContent(await response.json())) {
+          const payload: unknown = await response.json();
+          if (carriesReasoningContent(payload)) {
             discovered.push(model.id);
             extraReasoning[model.id] = true;
             ctx.ui.notify(`  ${model.id}: reasoning detected`, "info");
-          } else {
+          } else if (completionEmittedContent(payload)) {
             ctx.ui.notify(`  ${model.id}: no reasoning content`, "info");
+          } else {
+            // HTTP 200 but no output: lemonade may be masking a backend
+            // error, so the probe result is unknown, not "no reasoning".
+            ctx.ui.notify(
+              `  ${model.id}: HTTP 200 with empty completion (lemonade may be masking an upstream error), skipping`,
+              "warning",
+            );
           }
         } catch (error: unknown) {
           ctx.ui.notify(`  ${model.id}: probe failed (${String(error)}), skipping`, "warning");
