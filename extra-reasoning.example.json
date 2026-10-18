@@ -1,5 +1,10 @@
 {
-  "extraReasoning": {
-    "Example-Model-That-Reasons": true
+  "servers": {
+    "local": {
+      "Some-Model-That-Reasons": true
+    },
+    "office": {
+      "Another-Model-That-Reasons": true
+    }
   }
 }

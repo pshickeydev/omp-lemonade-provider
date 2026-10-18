@@ -1,13 +1,19 @@
 // omp extension: lemonade-server provider with capability-aware discovery.
 //
-// Registers a "lemonade" provider whose fetchDynamicModels maps lemonade's
-// /v1/models `labels` onto omp model metadata: the `reasoning` label onto a
-// thinking effort ladder (off => reasoning_effort:"none"), `vision` onto
-// image input, `chat` onto the roster filter, and the reported-or-derived
-// output cap onto maxTokens. Models that reason without the `reasoning` label
-// are tracked in the gitignored extra-reasoning.local.json next to this file;
-// run /lemonade-probe inside omp to populate it. Install, configuration, and
-// limitations: see README.md.
+// Registers one provider per lemonade server: "lemonade" for the local
+// instance (LEMONADE_BASE_URL, default http://localhost:13305) plus
+// "lemonade-<name>" for each entry of LEMONADE_LAN_SERVERS (0 or more, e.g.
+// "office=http://192.168.1.37:13305,kitchen=192.168.1.50"). Each provider's
+// fetchDynamicModels maps that server's /v1/models `labels` onto omp model
+// metadata: the `reasoning` label onto a thinking effort ladder (off =>
+// reasoning_effort:"none"), `vision` onto image input, `chat` onto the roster
+// filter, and the reported-or-derived output cap onto maxTokens. One provider
+// per server keeps each discovery fetch inside omp's 15 s dynamic-model
+// timeout and namespaces model IDs (`lemonade-office/<id>`), so two servers
+// hosting the same model never collide. Models that reason without the
+// `reasoning` label are tracked per server in the gitignored
+// extra-reasoning.local.json next to this file; run /lemonade-probe inside omp
+// to populate it. Install, configuration, and limitations: see README.md.
 
 import { readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -15,8 +21,92 @@ import { fileURLToPath } from "node:url";
 
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
-// Trailing slashes in the override would produce `//v1/...` request paths.
-const LEMONADE_BASE_URL = (process.env.LEMONADE_BASE_URL ?? "http://localhost:13305").replace(/\/+$/, "");
+// lemonade's default listen port; appended to LAN entries that give only a
+// host (or host-less URL) so `office=192.168.1.37` works.
+const DEFAULT_LEMONADE_PORT = 13305;
+
+// The local server's fixed key in extra-reasoning.local.json and in
+// /lemonade-probe selection. Its provider is the unsuffixed "lemonade".
+const LOCAL_SERVER_NAME = "local";
+
+interface LemonadeServer {
+  /** Key in extra-reasoning.local.json and /lemonade-probe argument. */
+  name: string;
+  /** omp provider name: `lemonade` (local) or `lemonade-<name>` (LAN). */
+  provider: string;
+  baseUrl: string;
+}
+
+// Normalize a configured URL: a bare host gets http:// and the lemonade
+// default port (`kitchen=192.168.1.50` -> `http://192.168.1.50:13305`), while
+// an explicit scheme keeps its own default port (`https://lemon.lan` stays on
+// 443 — bolting :13305 onto a TLS-proxied entry would break it). Trailing
+// slashes are stripped so request paths never become `//v1/...`. Returns
+// undefined for anything that is not an http(s) URL even after the repairs.
+function normalizeBaseUrl(raw: string): string | undefined {
+  let candidate = raw.trim();
+  if (candidate === "") return undefined;
+  const bareHost = !/^[a-z][a-z0-9+.-]*:\/\//i.test(candidate);
+  if (bareHost) candidate = `http://${candidate}`;
+  try {
+    const url = new URL(candidate);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return undefined;
+    if (bareHost && !url.port) url.port = String(DEFAULT_LEMONADE_PORT);
+    const path = url.pathname.replace(/\/+$/, "");
+    return url.origin + path;
+  } catch {
+    return undefined;
+  }
+}
+
+// LEMONADE_LAN_SERVERS: comma- or whitespace-separated `name=url` pairs.
+// Names become provider suffixes and probe selectors, so they are lowercased
+// and restricted to [a-z0-9_-] (no `/`, `:`, or space can leak into a
+// `provider/model` spec). Bad pairs warn and skip; duplicate names keep the
+// first.
+function parseLanServers(warn: (message: string) => void): LemonadeServer[] {
+  const servers: LemonadeServer[] = [];
+  const raw = process.env.LEMONADE_LAN_SERVERS?.trim();
+  if (!raw) return servers;
+  for (const pair of raw.split(/[\s,]+/)) {
+    if (pair === "") continue;
+    const eq = pair.indexOf("=");
+    if (eq <= 0) {
+      warn(`lemonade-provider: ignoring LEMONADE_LAN_SERVERS entry "${pair}" (expected name=url).`);
+      continue;
+    }
+    const name = pair.slice(0, eq).trim().toLowerCase();
+    const value = pair.slice(eq + 1).trim();
+    if (!/^[a-z][a-z0-9_-]*$/.test(name)) {
+      warn(`lemonade-provider: ignoring LEMONADE_LAN_SERVERS name "${name}" (must match [a-z][a-z0-9_-]*).`);
+      continue;
+    }
+    if (name === LOCAL_SERVER_NAME) {
+      warn(`lemonade-provider: "${LOCAL_SERVER_NAME}" names the local server; configure it via LEMONADE_BASE_URL.`);
+      continue;
+    }
+    const baseUrl = normalizeBaseUrl(value);
+    if (baseUrl === undefined) {
+      warn(`lemonade-provider: ignoring LEMONADE_LAN_SERVERS entry "${pair}" (not an http(s) URL).`);
+      continue;
+    }
+    if (servers.some((s) => s.name === name)) {
+      warn(`lemonade-provider: ignoring duplicate LEMONADE_LAN_SERVERS name "${name}".`);
+      continue;
+    }
+    servers.push({ name, provider: `lemonade-${name}`, baseUrl });
+  }
+  return servers;
+}
+
+// The local base URL keeps the legacy lenient behavior (only trailing-slash
+// stripping) if the override is set to something URL-parseable repairs
+// cannot handle; otherwise the same normalization LAN entries get applies.
+const localOverride = process.env.LEMONADE_BASE_URL;
+const LOCAL_BASE_URL =
+  localOverride === undefined
+    ? `http://localhost:${DEFAULT_LEMONADE_PORT}`
+    : (normalizeBaseUrl(localOverride) ?? localOverride.trim().replace(/\/+$/, ""));
 
 // Per-probe wall-clock budget. Generous because probing a cold model
 // JIT-loads its GGUF first (observed 90s+ on a 30GB box); models that
@@ -63,27 +153,48 @@ interface LemonadeModelEntry {
   max_completion_tokens?: number;
 }
 
+// server name -> model id -> true. The local server's bucket is keyed "local".
+type ExtraReasoningBuckets = Record<string, Record<string, true>>;
+
 interface ExtraReasoningFile {
-  extraReasoning?: Record<string, true>;
+  servers?: Record<string, unknown>;
+  // Legacy flat map (single-server era); read only when `servers` is absent
+  // and migrated into the "local" bucket. Never written back.
+  extraReasoning?: Record<string, unknown>;
 }
+
+// Values are filtered to `true` so hand-edited `false` entries drop out
+// instead of being probed forever.
+const filterTrue = (map: unknown): Record<string, true> | undefined => {
+  if (map === null || typeof map !== "object" || Array.isArray(map)) return undefined;
+  return Object.fromEntries(
+    Object.entries(map).filter(([, value]) => value === true),
+  ) as Record<string, true>;
+};
 
 // Missing file is the normal fresh-checkout path: label-only detection.
 // A corrupt file warns once and also degrades to label-only detection.
-function loadExtraReasoning(dir: string, warn: (message: string) => void): Record<string, true> {
+function loadExtraReasoning(dir: string, warn: (message: string) => void): ExtraReasoningBuckets {
   try {
     const parsed: unknown = JSON.parse(readFileSync(join(dir, "extra-reasoning.local.json"), "utf8"));
     // Narrow the parsed shape instead of casting; a malformed file degrades
-    // to label-only detection. Values are filtered to `true` so hand-edited
-    // `false` entries drop out instead of being probed forever.
-    if (parsed !== null && typeof parsed === "object" && "extraReasoning" in parsed) {
-      const map = parsed.extraReasoning; // unknown, guarded by `in` above
-      if (map !== null && typeof map === "object") {
-        const filtered = Object.entries(map).filter(([, value]) => value === true);
-        // The filter guarantees every value is `true`.
-        return Object.fromEntries(filtered) as Record<string, true>;
+    // to label-only detection.
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    const file = parsed as ExtraReasoningFile;
+    const buckets: ExtraReasoningBuckets = {};
+    if ("servers" in file && file.servers !== null && typeof file.servers === "object") {
+      for (const [name, map] of Object.entries(file.servers)) {
+        const filtered = filterTrue(map);
+        if (filtered) buckets[name] = filtered;
       }
+      return buckets;
     }
-    return {};
+    // Legacy single-server format: everything was the local server.
+    if ("extraReasoning" in file) {
+      const local = filterTrue(file.extraReasoning);
+      if (local && Object.keys(local).length > 0) buckets[LOCAL_SERVER_NAME] = local;
+    }
+    return buckets;
   } catch (error: unknown) {
     const isMissingFile =
       typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
@@ -107,9 +218,9 @@ type ModelListResult =
 
 // Shared /v1/models read for discovery and /lemonade-probe; never throws so
 // callers keep their own logging surface (pi.logger vs ctx.ui.notify).
-async function fetchModelList(): Promise<ModelListResult> {
+async function fetchModelList(baseUrl: string): Promise<ModelListResult> {
   try {
-    const response = await fetch(`${LEMONADE_BASE_URL}/v1/models`, {
+    const response = await fetch(`${baseUrl}/v1/models`, {
       signal: AbortSignal.timeout(10_000),
     });
     if (!response.ok) {
@@ -132,11 +243,56 @@ async function fetchModelList(): Promise<ModelListResult> {
       validCatalog: Array.isArray(data),
     };
   } catch (error: unknown) {
-    return { ok: false, error: `cannot reach ${LEMONADE_BASE_URL}: ${String(error)}` };
+    return { ok: false, error: `cannot reach ${baseUrl}: ${String(error)}` };
   }
 }
 
 const isChat = (m: LemonadeModelEntry): boolean => m.labels?.includes("chat") ?? false;
+const hasReasoningLabel = (m: LemonadeModelEntry): boolean => m.labels?.includes("reasoning") ?? false;
+
+// Map one lemonade catalog entry onto omp model metadata, with `bucket` the
+// extra-reasoning set for the server that reported it.
+function mapModel(m: LemonadeModelEntry, bucket: Record<string, true>) {
+  // `context_length` is the effective window: the loaded ctx_size, else
+  // the configured one, else the static maximum (server.cpp
+  // resolve_context_length). Lemonade auto-tunes ctx_size to the memory
+  // left for the KV cache and omp's own openai-compat discovery maps the
+  // same field, so this is the value the server will actually serve;
+  // max_context_window is only the model's ceiling, and 128000 the last
+  // resort when the server reports neither field.
+  const context =
+    positiveInt(m.context_length) ?? positiveInt(m.max_context_window) ?? 128000;
+  // The "reasoning" label is authoritative when present, but models in
+  // extra-reasoning.local.json were probed to emit reasoning_content
+  // without it. Both accept reasoning_effort:"none" as a hard off, so
+  // the ladder and the off->none mapping apply to them. Unknown future
+  // models default to the server label only; probe them with
+  // /lemonade-probe.
+  const isReasoning = hasReasoningLabel(m) || bucket[m.id] === true;
+  return {
+    id: m.id,
+    name: m.id,
+    api: "openai-completions" as const,
+    reasoning: isReasoning,
+    input: ["text" as const, ...(m.labels?.includes("vision") ? (["image"] as const) : [])],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: context,
+    maxTokens: resolveMaxTokens(m, context),
+    // reasoningDisableMode "none-effort" makes thinking-off send
+    // reasoning_effort:"none", the hard reasoning-off lemonade
+    // (llama.cpp-backed) understands; graded levels forward verbatim.
+    ...(isReasoning
+      ? {
+          thinking: {
+            mode: "effort" as const,
+            efforts: ["low", "medium", "high"] as const,
+            defaultLevel: "medium" as const,
+          },
+          compat: { reasoningDisableMode: "none-effort" as const },
+        }
+      : {}),
+  };
+}
 
 // Narrow a chat-completion payload to "first choice emitted non-empty
 // reasoning_content" without an unchecked cast; OpenAI-compatible servers
@@ -176,137 +332,137 @@ function completionEmittedContent(payload: unknown): boolean {
 }
 
 export default function lemonadeProvider(pi: ExtensionAPI) {
+  const warn = (message: string) => pi.logger?.warn?.(message);
+  const servers: LemonadeServer[] = [
+    { name: LOCAL_SERVER_NAME, provider: "lemonade", baseUrl: LOCAL_BASE_URL },
+    ...parseLanServers(warn),
+  ];
+
   // extra-reasoning.local.json lives beside the real source file (realpath
   // follows the ~/.omp/agent/extensions install symlink), so it stays in the
   // repo checkout rather than the symlink directory.
   const dir = realpathSync(dirname(fileURLToPath(import.meta.url)));
-  const extraReasoning = loadExtraReasoning(dir, (message) => pi.logger?.warn?.(message));
+  const buckets: ExtraReasoningBuckets = loadExtraReasoning(dir, warn);
 
-  pi.registerProvider("lemonade", {
-    baseUrl: `${LEMONADE_BASE_URL}/v1`,
-    api: "openai-completions",
-    // lemonade is keyless locally; the apiKey field satisfies the custom-provider
-    // requirement without sending a real credential. auth: none is the models.yml
-    // spelling; extensions use an apiKey placeholder instead.
-    apiKey: "LEMONADE_API_KEY_PLACEHOLDER",
-    fetchDynamicModels: async () => {
-      const result = await fetchModelList();
-      if (!result.ok) {
-        pi.logger?.warn?.(`lemonade-provider: ${result.error}`);
-        return [];
-      }
+  for (const server of servers) {
+    pi.registerProvider(server.provider, {
+      baseUrl: `${server.baseUrl}/v1`,
+      api: "openai-completions",
+      // lemonade is keyless locally; the apiKey field satisfies the custom-provider
+      // requirement without sending a real credential. auth: none is the models.yml
+      // spelling; extensions use an apiKey placeholder instead.
+      apiKey: "LEMONADE_API_KEY_PLACEHOLDER",
+      fetchDynamicModels: async () => {
+        const result = await fetchModelList(server.baseUrl);
+        if (!result.ok) {
+          warn(`[${server.name}] ${result.error}`);
+          return [];
+        }
+        const bucket = buckets[server.name] ?? {};
+        return result.entries.filter(isChat).map((m) => mapModel(m, bucket));
+      },
+    });
+  }
 
-      return result.entries
-        .filter(isChat)
-        .map((m) => {
-          // `context_length` is the effective window: the loaded ctx_size, else
-          // the configured one, else the static maximum (server.cpp
-          // resolve_context_length). Lemonade auto-tunes ctx_size to the memory
-          // left for the KV cache and omp's own openai-compat discovery maps the
-          // same field, so this is the value the server will actually serve;
-          // max_context_window is only the model's ceiling, and 128000 the last
-          // resort when the server reports neither field.
-          const context =
-            positiveInt(m.context_length) ?? positiveInt(m.max_context_window) ?? 128000;
-          // The "reasoning" label is authoritative when present, but models in
-          // extra-reasoning.local.json were probed to emit reasoning_content
-          // without it. Both accept reasoning_effort:"none" as a hard off, so
-          // the ladder and the off->none mapping apply to them. Unknown future
-          // models default to the server label only; probe them with
-          // /lemonade-probe.
-          const isReasoning =
-            (m.labels?.includes("reasoning") ?? false) || extraReasoning[m.id] === true;
-          return {
-            id: m.id,
-            name: m.id,
-            api: "openai-completions" as const,
-            reasoning: isReasoning,
-            input: ["text" as const, ...(m.labels?.includes("vision") ? (["image"] as const) : [])],
-            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-            contextWindow: context,
-            maxTokens: resolveMaxTokens(m, context),
-            // reasoningDisableMode "none-effort" makes thinking-off send
-            // reasoning_effort:"none", the hard reasoning-off lemonade
-            // (llama.cpp-backed) understands; graded levels forward verbatim.
-            ...(isReasoning
-              ? {
-                  thinking: {
-                    mode: "effort" as const,
-                    efforts: ["low", "medium", "high"] as const,
-                    defaultLevel: "medium" as const,
-                  },
-                  compat: { reasoningDisableMode: "none-effort" as const },
-                }
-              : {}),
-          };
-        });
-    },
-  });
-
-  // /lemonade-probe: behavioral detection for a different lemonade instance.
-  // Sequentially probes chat models that lack the "reasoning" label (and are
-  // not already in the local list) with a tiny completion request; models whose
-  // response carries reasoning_content are added to extra-reasoning.local.json.
-  // Cold models JIT-load on first probe, so this can take a while; failures are
-  // skipped, never fatal. Run `omp models refresh lemonade` afterwards.
+  // /lemonade-probe [name ...]: behavioral detection for unlabeled reasoners.
+  // With no argument it walks every configured server; with names it probes
+  // only those (`local` plus the LAN names). Per server it sequentially probes
+  // chat models that lack the "reasoning" label (and are not already listed
+  // for that server) with a tiny completion request; models whose response
+  // carries reasoning_content are added to that server's bucket in
+  // extra-reasoning.local.json, and entries for models no longer on that
+  // server are pruned. Cold models JIT-load on first probe, so this can take a
+  // while; failures are skipped, never fatal. Run
+  // `omp models refresh <provider>` afterwards.
   pi.registerCommand("lemonade-probe", {
-    description: "Probe lemonade chat models for unlabeled reasoning support and update the local list",
-    handler: async (_args, ctx) => {
-      ctx.ui.notify("lemonade-probe: fetching model list...", "info");
-      const result = await fetchModelList();
-      if (!result.ok) {
-        ctx.ui.notify(`lemonade-probe: ${result.error}`, "error");
-        return;
-      }
-      const entries = result.entries;
+    description:
+      "Probe lemonade chat servers' models for unlabeled reasoning support and update the per-server lists",
+    handler: async (args, ctx) => {
+      const selection = (args ?? "")
+        .trim()
+        .split(/[\s,]+/)
+        .filter((token) => token !== "")
+        .map((token) => token.toLowerCase());
 
-      // A malformed /v1/models (no data array) yields an empty, untrustworthy
-      // list. Refuse to prune rather than wiping the local list on a bad read;
-      // a genuinely empty catalog (empty array) is trustworthy and prunes.
-      if (!result.validCatalog) {
-        ctx.ui.notify(
-          "lemonade-probe: /v1/models response had no data array; pruned nothing and have nothing to probe.",
-          "warning",
-        );
-        return;
-      }
-
-      // Drop stale keys: a model removed from the server drops out of the
-      // /v1/models catalog, so any local entry whose ID is now absent is dead
-      // weight. Prune first so removal is tracked even when nothing new is to
-      // be probed.
-      const staleIds = Object.keys(extraReasoning).filter((id) =>
-        !entries.some((m) => m.id === id),
-      );
-      for (const id of staleIds) delete extraReasoning[id];
-
-      const unlabeled = entries.filter(
-        (m) =>
-          isChat(m) &&
-          !(m.labels?.includes("reasoning") ?? false) &&
-          extraReasoning[m.id] !== true,
-      );
-
-      if (unlabeled.length === 0 && staleIds.length === 0) {
-        ctx.ui.notify("lemonade-probe: nothing new to probe and no stale entries to remove.", "info");
-        return;
-      }
-
-      const discovered: string[] = [];
-      if (unlabeled.length > 0) {
-        if (staleIds.length > 0) {
+      let targets: LemonadeServer[];
+      if (selection.length === 0) {
+        targets = servers;
+      } else {
+        const byName = new Map(servers.map((s) => [s.name, s]));
+        const unknown = selection.filter((name) => !byName.has(name));
+        if (unknown.length > 0) {
           ctx.ui.notify(
-            `lemonade-probe: removed ${staleIds.length} stale model(s) no longer on the server.`,
+            `lemonade-probe: unknown server(s): ${unknown.join(", ")} — known: ${servers.map((s) => s.name).join(", ")}.`,
+            "error",
+          );
+          return;
+        }
+        targets = [...new Set(selection)].map((name) => byName.get(name)!);
+      }
+
+      let addedTotal = 0;
+      let removedTotal = 0;
+      const touchedProviders = new Set<string>();
+
+      for (const server of targets) {
+        ctx.ui.notify(`lemonade-probe [${server.name}]: fetching model list...`, "info");
+        const result = await fetchModelList(server.baseUrl);
+        if (!result.ok) {
+          // Unreachable server: skip it entirely — its bucket is neither
+          // pruned (that would empty it on a transient failure) nor probed.
+          ctx.ui.notify(`lemonade-probe [${server.name}]: ${result.error}`, "warning");
+          continue;
+        }
+
+        // A malformed /v1/models (no data array) yields an empty, untrustworthy
+        // list. Refuse to prune rather than wiping the local list on a bad read;
+        // a genuinely empty catalog (empty array) is trustworthy and prunes.
+        if (!result.validCatalog) {
+          ctx.ui.notify(
+            `lemonade-probe [${server.name}]: /v1/models response had no data array; pruned nothing and have nothing to probe.`,
+            "warning",
+          );
+          continue;
+        }
+
+        const bucket = (buckets[server.name] ??= {});
+
+        // Drop stale keys: a model removed from the server drops out of the
+        // /v1/models catalog, so any local entry whose ID is now absent is
+        // dead weight. Prune first so removal is tracked even when nothing
+        // new is to be probed. Only this server's bucket is touched: the same
+        // model ID on another server keeps its own verdict.
+        const staleIds = Object.keys(bucket).filter((id) =>
+          !result.entries.some((m) => m.id === id),
+        );
+        for (const id of staleIds) delete bucket[id];
+        if (staleIds.length > 0) {
+          removedTotal += staleIds.length;
+          touchedProviders.add(server.provider);
+          ctx.ui.notify(
+            `lemonade-probe [${server.name}]: removed ${staleIds.length} stale model(s) no longer on the server.`,
             "info",
           );
         }
+
+        const unlabeled = result.entries.filter(
+          (m) => isChat(m) && !hasReasoningLabel(m) && bucket[m.id] !== true,
+        );
+
+        if (unlabeled.length === 0) {
+          if (staleIds.length === 0) {
+            ctx.ui.notify(`lemonade-probe [${server.name}]: nothing new to probe and no stale entries to remove.`, "info");
+          }
+          continue;
+        }
+
         ctx.ui.notify(
-          `lemonade-probe: probing ${unlabeled.length} model(s) sequentially — cold models load on first use and can take minutes each.`,
+          `lemonade-probe [${server.name}]: probing ${unlabeled.length} model(s) sequentially — cold models load on first use and can take minutes each.`,
           "info",
         );
         for (const model of unlabeled) {
           try {
-            const response = await fetch(`${LEMONADE_BASE_URL}/v1/chat/completions`, {
+            const response = await fetch(`${server.baseUrl}/v1/chat/completions`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({
@@ -319,36 +475,57 @@ export default function lemonadeProvider(pi: ExtensionAPI) {
               signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
             });
             if (!response.ok) {
-              ctx.ui.notify(`  ${model.id}: HTTP ${response.status}, skipping`, "warning");
+              ctx.ui.notify(`  [${server.name}] ${model.id}: HTTP ${response.status}, skipping`, "warning");
               continue;
             }
             const payload: unknown = await response.json();
             if (carriesReasoningContent(payload)) {
-              discovered.push(model.id);
-              extraReasoning[model.id] = true;
-              ctx.ui.notify(`  ${model.id}: reasoning detected`, "info");
+              bucket[model.id] = true;
+              addedTotal += 1;
+              touchedProviders.add(server.provider);
+              ctx.ui.notify(`  [${server.name}] ${model.id}: reasoning detected`, "info");
             } else if (completionEmittedContent(payload)) {
-              ctx.ui.notify(`  ${model.id}: no reasoning content`, "info");
+              ctx.ui.notify(`  [${server.name}] ${model.id}: no reasoning content`, "info");
             } else {
               // HTTP 200 but no output: lemonade may be masking a backend
               // error, so the probe result is unknown, not "no reasoning".
               ctx.ui.notify(
-                `  ${model.id}: HTTP 200 with empty completion (lemonade may be masking an upstream error), skipping`,
+                `  [${server.name}] ${model.id}: HTTP 200 with empty completion (lemonade may be masking an upstream error), skipping`,
                 "warning",
               );
             }
           } catch (error: unknown) {
-            ctx.ui.notify(`  ${model.id}: probe failed (${String(error)}), skipping`, "warning");
+            ctx.ui.notify(`  [${server.name}] ${model.id}: probe failed (${String(error)}), skipping`, "warning");
           }
         }
       }
 
-      if (discovered.length > 0 || staleIds.length > 0) {
-        const file: ExtraReasoningFile = { extraReasoning };
+      // Buckets for servers not configured in this environment (a LAN entry
+      // removed from LEMONADE_LAN_SERVERS, or an env-less shell) can never be
+      // pruned: there is no catalog to check them against. Report instead of
+      // delete — the next run with the server configured prunes them properly,
+      // and an env-less shell must not destroy a still-valid bucket.
+      const orphaned = Object.keys(buckets).filter(
+        (name) => !servers.some((s) => s.name === name),
+      );
+      if (orphaned.length > 0) {
+        ctx.ui.notify(
+          `lemonade-probe: buckets exist for servers not configured here: ${orphaned.join(", ")} — re-add the server and run /lemonade-probe to prune, or delete the bucket by hand.`,
+          "info",
+        );
+      }
+
+      if (addedTotal > 0 || removedTotal > 0) {
+        // Drop emptied buckets so the file stays tidy.
+        for (const name of Object.keys(buckets)) {
+          if (Object.keys(buckets[name]!).length === 0) delete buckets[name];
+        }
+        const file = { servers: buckets };
         const path = join(dir, "extra-reasoning.local.json");
         writeFileSync(path, `${JSON.stringify(file, null, 2)}\n`);
+        const refresh = [...touchedProviders].map((p) => `omp models refresh ${p}`).join(" / ");
         ctx.ui.notify(
-          `lemonade-probe: wrote ${path} — added ${discovered.length}, removed ${staleIds.length} stale model(s). Run \`omp models refresh lemonade\` (or restart omp) to apply.`,
+          `lemonade-probe: wrote ${path} — added ${addedTotal}, removed ${removedTotal} stale model(s). Run \`${refresh}\` (or restart omp) to apply.`,
           "info",
         );
       } else {

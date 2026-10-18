@@ -3,7 +3,8 @@
 An [omp](https://github.com/can1357/oh-my-pi) extension that registers a
 `lemonade` provider with capability-aware model discovery for
 [Lemonade Server](https://github.com/lemonade-sdk/lemonade) (AMD's local LLM
-runtime).
+runtime), simultaneously for a local server plus any number of servers on the
+LAN.
 
 ## What it does
 
@@ -41,53 +42,90 @@ companion `extra-reasoning.local.json` lives beside the source here, not in
 
 ## Configuration
 
-The server URL defaults to `http://localhost:13305`. Override with an
-environment variable (e.g. in `~/.bashrc`) to point at another instance:
+The local server defaults to `http://localhost:13305`; override with an
+environment variable (e.g. in `~/.bashrc`):
 
 ```bash
-export LEMONADE_BASE_URL="http://192.168.1.37:13305"
+export LEMONADE_BASE_URL="http://localhost:13305"
 ```
+
+Add LAN servers — 0 or more — as comma-separated `name=url` pairs:
+
+```bash
+export LEMONADE_LAN_SERVERS="office=http://192.168.1.37:13305,kitchen=192.168.1.50"
+```
+
+Each entry registers its own provider: `lemonade` for the local server,
+`lemonade-<name>` for each LAN entry, so models are selected as
+`lemonade/<id>`, `lemonade-office/<id>`, … and identically named models on
+different servers never collide. Names must match `[a-z][a-z0-9_-]*` (they
+become provider suffixes and `/lemonade-probe` selectors). A bare host gets
+`http://` and the lemonade default port `13305`, so `kitchen=192.168.1.50`
+works; a URL that names its own scheme keeps that scheme's default port
+(`https://lemon.lan` stays on 443), so give an explicit `:port` to override.
+Malformed or duplicate entries warn and are skipped. Each provider's
+discovery probes only its own server, so one down
+server degrades its own roster, not the others'.
 
 ## Unlabeled reasoning models
 
 Lemonade derives its `reasoning` label from registry metadata, not from the
 GGUF chat template, so thinking models can be served without it. These are
-tracked in `extra-reasoning.local.json` (gitignored — the list is
-machine-local, never committed):
+tracked per server in `extra-reasoning.local.json` (gitignored — the lists
+are machine-local, never committed), keyed by server name (`local` plus the
+LAN names):
 
 ```json
 {
-  "extraReasoning": {
-    "Some-Model-That-Reasons": true
+  "servers": {
+    "local": {
+      "Some-Model-That-Reasons": true
+    },
+    "office": {
+      "Another-Model-That-Reasons": true
+    }
   }
 }
 ```
 
+A model's verdict is per server: the same model ID served by two machines with
+different builds gets probed (and can differ) on each.
+
 See `extra-reasoning.example.json` for the shape. A missing file (fresh
 checkout) degrades to label-only detection; a corrupt file warns once and also
-degrades. Models with the server `reasoning` label always keep their ladder.
+degrades. A legacy flat `{"extraReasoning": {...}}` file (single-server era)
+is read as the `local` server's list; it is migrated to the `servers` shape
+the next time `/lemonade-probe` writes the file. Models with the server
+`reasoning` label always keep their ladder.
 
-## Updating the list: `/lemonade-probe`
+## Updating the lists: `/lemonade-probe`
 
 Inside an omp session, run:
 
 ```
-/lemonade-probe
+/lemonade-probe                 # all servers: local + every LAN entry
+/lemonade-probe office          # only the `office` server
+/lemonade-probe local kitchen   # any combination
 ```
 
-It probes each chat model that lacks the `reasoning` label and isn't already
-listed, with a small completion request (`"What is 17*23? Think briefly then
-answer."`, `max_tokens: 512` — trivial prompts don't elicit reasoning on all
-models), and appends models whose response carries `reasoning_content` to
-`extra-reasoning.local.json`. Probes run sequentially with a 120 s budget each;
-cold models JIT-load on first probe and can take minutes. It also drops any
-entry in `extra-reasoning.local.json` for a model that is no longer on the
-server (gone from `/v1/models`), so the list does not accumulate dead
-entries — it rewrites the file whenever it adds or removes something. If the
-server's `/v1/models` response is malformed (no `data` array) the list is left
-untouched and this is reported, so a bad read can never wipe it.
-After it
-reports additions, run `omp models refresh lemonade` (or restart omp) to apply.
+For each selected server it probes every chat model that lacks the
+`reasoning` label and isn't already listed for that server, with a small
+completion request (`"What is 17*23? Think briefly then answer."`,
+`max_tokens: 512` — trivial prompts don't elicit reasoning on all models), and
+appends models whose response carries `reasoning_content` to that server's
+bucket in `extra-reasoning.local.json`. Probes run sequentially with a 120 s
+budget each; cold models JIT-load on first probe and can take minutes. It also
+drops entries in a probed server's bucket for models no longer on that server
+(gone from its `/v1/models`), so the lists do not accumulate dead entries —
+it rewrites the file whenever it adds or removes something. An unreachable or
+malformed server is reported and skipped: its bucket is neither pruned nor
+probed, so a transient failure can never wipe it. A bucket belonging to a
+server that is no longer configured in the current environment (e.g. a LAN
+entry dropped from `LEMONADE_LAN_SERVERS`) can never be pruned — it is
+reported so, and kept until that server returns or you delete it by hand.
+After it reports additions,
+run `omp models refresh <provider>` (e.g. `omp models refresh
+lemonade-office`, or `lemonade` for the local server) to apply.
 
 ## Output cap
 
@@ -120,7 +158,9 @@ every request's cap to the room actually left
 ## Verification
 
 - `omp models find lemonade` — roster with thinking ladders on reasoners
+- `omp models find lemonade-<name>` — the same for a LAN server's roster
 - `omp -p --model lemonade/<id> --thinking high "Reply with exactly: ok"`
+- `omp -p --model lemonade-<name>/<id> "Reply with exactly: ok"`
 
 ## Notes and limitations
 
