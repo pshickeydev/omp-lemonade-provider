@@ -3,8 +3,13 @@
 // Registers one provider per lemonade server: "lemonade" for the local
 // instance (LEMONADE_BASE_URL, default http://localhost:13305) plus
 // "lemonade-<name>" for each entry of LEMONADE_LAN_SERVERS (0 or more, e.g.
-// "office=http://192.168.1.37:13305,kitchen=192.168.1.50"). Each provider's
-// fetchDynamicModels maps that server's /v1/models `labels` onto omp model
+// "office=http://192.168.1.37:13305,kitchen=192.168.1.50"). Key-protected
+// servers authenticate with `Authorization: Bearer <key>`: lemonade gates its
+// regular API endpoints on a server-side LEMONADE_API_KEY. This extension
+// reads its credential from LEMONADE_API_KEY (LEMONADE_ADMIN_API_KEY as
+// fallback) for the local server and LEMONADE_LAN_<NAME>_API_KEY per LAN
+// server. Each provider's fetchDynamicModels maps that server's /v1/models
+// `labels` onto omp model
 // metadata: the `reasoning` label onto a thinking effort ladder (off =>
 // reasoning_effort:"none"), `vision` onto image input, `chat` onto the roster
 // filter, and the reported-or-derived output cap onto maxTokens. One provider
@@ -29,12 +34,34 @@ const DEFAULT_LEMONADE_PORT = 13305;
 // /lemonade-probe selection. Its provider is the unsuffixed "lemonade".
 const LOCAL_SERVER_NAME = "local";
 
+// Read an API key from the environment; unset or blank means keyless.
+const readEnvKey = (name: string): string | undefined => {
+  const value = process.env[name]?.trim();
+  return value === "" ? undefined : value;
+};
+
+// Env var holding LAN server `name`'s key: `office` ->
+// LEMONADE_LAN_OFFICE_API_KEY. The LEMONADE_LAN_ prefix keeps these names
+// out of two collision paths: `admin` would otherwise derive
+// LEMONADE_ADMIN_API_KEY, the var the local fallback reads (a LAN `admin`
+// entry and the local server silently sharing one key), and lemonade itself
+// owns LEMONADE_<PROVIDER>_API_KEY for cloud providers (e.g. an `office`
+// cloud recipe on a lemond sharing this environment). `-` maps to `_` so the
+// name stays a POSIX-shell identifier; `a-b` and `a_b` collapse onto the same
+// variable.
+const lanKeyEnvName = (name: string): string =>
+  `LEMONADE_LAN_${name.toUpperCase().replace(/-/g, "_")}_API_KEY`;
+
 interface LemonadeServer {
   /** Key in extra-reasoning.local.json and /lemonade-probe argument. */
   name: string;
   /** omp provider name: `lemonade` (local) or `lemonade-<name>` (LAN). */
   provider: string;
   baseUrl: string;
+  /** Client credential sent as `Authorization: Bearer <key>` when set. */
+  apiKey?: string;
+  /** Env var to set when this server rejects an unauthenticated request. */
+  keyEnvHint: string;
 }
 
 // Normalize a configured URL: a bare host gets http:// and the lemonade
@@ -61,9 +88,10 @@ function normalizeBaseUrl(raw: string): string | undefined {
 
 // LEMONADE_LAN_SERVERS: comma- or whitespace-separated `name=url` pairs.
 // Names become provider suffixes and probe selectors, so they are lowercased
-// and restricted to [a-z0-9_-] (no `/`, `:`, or space can leak into a
-// `provider/model` spec). Bad pairs warn and skip; duplicate names keep the
-// first.
+// and restricted to [a-z][a-z0-9_-] (no `/`, `:`, or space can leak into a
+// `provider/model` spec). A key-protected server's key is read from
+// LEMONADE_LAN_<NAME>_API_KEY. Bad pairs warn and skip; duplicate names keep
+// the first.
 function parseLanServers(warn: (message: string) => void): LemonadeServer[] {
   const servers: LemonadeServer[] = [];
   const raw = process.env.LEMONADE_LAN_SERVERS?.trim();
@@ -94,7 +122,13 @@ function parseLanServers(warn: (message: string) => void): LemonadeServer[] {
       warn(`lemonade-provider: ignoring duplicate LEMONADE_LAN_SERVERS name "${name}".`);
       continue;
     }
-    servers.push({ name, provider: `lemonade-${name}`, baseUrl });
+    servers.push({
+      name,
+      provider: `lemonade-${name}`,
+      baseUrl,
+      apiKey: readEnvKey(lanKeyEnvName(name)),
+      keyEnvHint: lanKeyEnvName(name),
+    });
   }
   return servers;
 }
@@ -107,6 +141,13 @@ const LOCAL_BASE_URL =
   localOverride === undefined
     ? `http://localhost:${DEFAULT_LEMONADE_PORT}`
     : (normalizeBaseUrl(localOverride) ?? localOverride.trim().replace(/\/+$/, ""));
+
+// Key for the local server. Lemonade's own clients prefer
+// LEMONADE_ADMIN_API_KEY, but this extension only touches regular API
+// endpoints, so it prefers the least-privileged LEMONADE_API_KEY and falls
+// back to the admin key only when the standard key is unset.
+const LOCAL_API_KEY =
+  readEnvKey("LEMONADE_API_KEY") ?? readEnvKey("LEMONADE_ADMIN_API_KEY");
 
 // Per-probe wall-clock budget. Generous because probing a cold model
 // JIT-loads its GGUF first (observed 90s+ on a 30GB box); models that
@@ -218,13 +259,24 @@ type ModelListResult =
 
 // Shared /v1/models read for discovery and /lemonade-probe; never throws so
 // callers keep their own logging surface (pi.logger vs ctx.ui.notify).
-async function fetchModelList(baseUrl: string): Promise<ModelListResult> {
+async function fetchModelList(
+  baseUrl: string,
+  apiKey?: string,
+  keyHint?: string,
+): Promise<ModelListResult> {
   try {
     const response = await fetch(`${baseUrl}/v1/models`, {
+      headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : undefined,
       signal: AbortSignal.timeout(10_000),
     });
     if (!response.ok) {
-      return { ok: false, error: `/v1/models returned HTTP ${response.status}` };
+      // A keyless request against a gated server is the common
+      // misconfiguration; name the env var instead of logging a bare 401.
+      const gated =
+        !apiKey && (response.status === 401 || response.status === 403) && keyHint
+          ? ` — server requires an API key; set ${keyHint}`
+          : "";
+      return { ok: false, error: `/v1/models returned HTTP ${response.status}${gated}` };
     }
     const payload: unknown = await response.json();
     // Runtime-narrow the wire shape; per-entry fields stay optional and are
@@ -334,7 +386,13 @@ function completionEmittedContent(payload: unknown): boolean {
 export default function lemonadeProvider(pi: ExtensionAPI) {
   const warn = (message: string) => pi.logger?.warn?.(message);
   const servers: LemonadeServer[] = [
-    { name: LOCAL_SERVER_NAME, provider: "lemonade", baseUrl: LOCAL_BASE_URL },
+    {
+      name: LOCAL_SERVER_NAME,
+      provider: "lemonade",
+      baseUrl: LOCAL_BASE_URL,
+      apiKey: LOCAL_API_KEY,
+      keyEnvHint: "LEMONADE_API_KEY (or LEMONADE_ADMIN_API_KEY)",
+    },
     ...parseLanServers(warn),
   ];
 
@@ -348,12 +406,15 @@ export default function lemonadeProvider(pi: ExtensionAPI) {
     pi.registerProvider(server.provider, {
       baseUrl: `${server.baseUrl}/v1`,
       api: "openai-completions",
-      // lemonade is keyless locally; the apiKey field satisfies the custom-provider
-      // requirement without sending a real credential. auth: none is the models.yml
-      // spelling; extensions use an apiKey placeholder instead.
-      apiKey: "LEMONADE_API_KEY_PLACEHOLDER",
+      // omp extensions require a credential field for custom providers.
+      // Keyless servers (the common case) get a harmless placeholder that
+      // lemonade ignores; a configured key is passed literally — per omp's
+      // extension docs a registered apiKey overrides any stored /login
+      // credential, and the openai-completions transport sends it as
+      // `Authorization: Bearer <key>`.
+      apiKey: server.apiKey ?? "LEMONADE_API_KEY_PLACEHOLDER",
       fetchDynamicModels: async () => {
-        const result = await fetchModelList(server.baseUrl);
+        const result = await fetchModelList(server.baseUrl, server.apiKey, server.keyEnvHint);
         if (!result.ok) {
           warn(`[${server.name}] ${result.error}`);
           return [];
@@ -406,7 +467,7 @@ export default function lemonadeProvider(pi: ExtensionAPI) {
 
       for (const server of targets) {
         ctx.ui.notify(`lemonade-probe [${server.name}]: fetching model list...`, "info");
-        const result = await fetchModelList(server.baseUrl);
+        const result = await fetchModelList(server.baseUrl, server.apiKey, server.keyEnvHint);
         if (!result.ok) {
           // Unreachable server: skip it entirely — its bucket is neither
           // pruned (that would empty it on a transient failure) nor probed.
@@ -464,7 +525,10 @@ export default function lemonadeProvider(pi: ExtensionAPI) {
           try {
             const response = await fetch(`${server.baseUrl}/v1/chat/completions`, {
               method: "POST",
-              headers: { "Content-Type": "application/json" },
+              headers: {
+                "Content-Type": "application/json",
+                ...(server.apiKey ? { Authorization: `Bearer ${server.apiKey}` } : {}),
+              },
               body: JSON.stringify({
                 model: model.id,
                 messages: [

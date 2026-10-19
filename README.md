@@ -67,6 +67,38 @@ Malformed or duplicate entries warn and are skipped. Each provider's
 discovery probes only its own server, so one down
 server degrades its own roster, not the others'.
 
+### API keys (optional)
+
+Keyless servers — the default — need nothing. When the server process runs
+with lemonade's `LEMONADE_API_KEY`, its regular endpoints (`/v1`, `/api`,
+`/v0`) reject any request without a matching `Authorization: Bearer` token
+([configuration guide](https://lemonade-server.ai/docs/guide/configuration/)).
+Give this extension the same credential via the environment:
+
+```bash
+export LEMONADE_API_KEY="s3cret"              # local server
+export LEMONADE_LAN_OFFICE_API_KEY="s3cret"   # the `office` LAN entry
+```
+
+LAN key variables are `LEMONADE_LAN_<NAME>_API_KEY` with the server name
+uppercased and `-` mapped to `_` (`rack-2` → `LEMONADE_LAN_RACK_2_API_KEY`).
+The `LEMONADE_LAN_` prefix is deliberate: an unprefixed `admin` entry would
+derive `LEMONADE_ADMIN_API_KEY` — the local server's admin-fallback variable —
+and silently share one key; lemonade also owns `LEMONADE_<PROVIDER>_API_KEY`
+for cloud providers. For the local server `LEMONADE_ADMIN_API_KEY` is
+accepted as a fallback when
+`LEMONADE_API_KEY` is unset — lemonade's own clients prefer the admin key,
+but this extension only touches regular endpoints, so it prefers the
+least-privileged standard key. The key rides on every request the extension
+itself makes — discovery (`GET /v1/models`) and `/lemonade-probe` completions
+— and is handed to omp as the provider credential, so chat completions carry
+it too. A missing key surfaces as a `/v1/models returned HTTP 401 — server
+requires an API key; set <VAR>` warning naming the variable to set; a wrong
+key returns a bare 401 and an empty roster. Over plain `http://` the bearer
+token is
+visible on the wire: put LAN servers behind TLS (`https://` base URLs) when
+the key matters.
+
 ## Unlabeled reasoning models
 
 Lemonade derives its `reasoning` label from registry metadata, not from the
@@ -164,10 +196,12 @@ every request's cap to the room actually left
 
 ## Notes and limitations
 
-- The provider sends a placeholder `Authorization: Bearer
-  LEMONADE_API_KEY_PLACEHOLDER` header: omp extensions require a credential
-  field for custom providers, and lemonade is keyless, so the header is
-  harmless.
+- When no key is configured, the provider sends a placeholder
+  `Authorization: Bearer LEMONADE_API_KEY_PLACEHOLDER` header: omp extensions
+  require a credential field for custom providers, and a keyless lemonade
+  ignores the header. With a key configured (see
+  [API keys](#api-keys-optional)) the real key replaces the placeholder on
+  every request, including this extension's own discovery and probe fetches.
 - Effort levels route through OpenAI `reasoning_effort`; lemonade forwards
   values other than `"none"` verbatim to llama.cpp, so graded effects are
   chat-template-dependent per model.
